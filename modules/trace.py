@@ -1,9 +1,13 @@
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 from .defs.samplers import SAMPLERS
 from .utils.log import print_warning
 
 class Trace:
-    _trace_cache = {}
+    # Bounded: the cache key is derived from the workflow structure, so a long
+    # running ComfyUI session that edits many workflows would otherwise keep
+    # every trace tree alive forever.
+    TRACE_CACHE_LIMIT = 256
+    _trace_cache = OrderedDict()
 
     @staticmethod
     def _bfs_traverse(start_node_id, prompt, visit_node, edge_condition=None):
@@ -60,13 +64,17 @@ class Trace:
     def trace(cls, start_node_id, prompt):
         sig = cls._compute_trace_signature(start_node_id, prompt)
         if sig in cls._trace_cache:
+            cls._trace_cache.move_to_end(sig)
             return cls._trace_cache[sig]
 
         trace_tree = {}
         def build_trace(nid, node, dist):
             trace_tree[nid] = (dist, node.get("class_type", ""))
         cls._bfs_traverse(start_node_id, prompt, build_trace)
+
         cls._trace_cache[sig] = trace_tree
+        while len(cls._trace_cache) > cls.TRACE_CACHE_LIMIT:
+            cls._trace_cache.popitem(last=False)
         return trace_tree
 
     @classmethod

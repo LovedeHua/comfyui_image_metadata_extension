@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import inspect
 from collections import defaultdict
 from . import hook
 from .defs.captures import CAPTURE_FIELD_LIST
@@ -21,23 +22,38 @@ class OutputCacheCompat:
     def __init__(self, cache):
         self._cache = cache
 
-    def get_output_cache(self, input_unique_id, unique_id=None):
-        # For version 0.3.67 and newer
-        if hasattr(self._cache, "get"):
-            return self._cache.get(input_unique_id)
+    def _lookup_cached(self, input_unique_id, unique_id=None):
+        # Newer ComfyUI cache objects expose an async get() and a sync get_local().
+        # This shim is used from synchronous metadata capture code, so prefer the
+        # synchronous accessors and reject awaitable results from get().
+        get_local = getattr(self._cache, "get_local", None)
+        if callable(get_local):
+            return get_local(input_unique_id)
+
+        get_cache = getattr(self._cache, "get_cache", None)
+        if callable(get_cache):
+            try:
+                return get_cache(input_unique_id, unique_id)
+            except TypeError:
+                return get_cache(input_unique_id)
+
+        getter = getattr(self._cache, "get", None)
+        if callable(getter):
+            result = getter(input_unique_id)
+            if not inspect.isawaitable(result):
+                return result
+
         return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
 
+    def get_output_cache(self, input_unique_id, unique_id=None):
+        return self._lookup_cached(input_unique_id, unique_id)
+
     def get(self, input_unique_id):
-        # For version 0.3.66 and lower
-        if hasattr(self._cache, "get"):
-            return self._cache.get(input_unique_id)
-        return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
-    
+        return self._lookup_cached(input_unique_id)
+
     # fix: https://github.com/edelvarden/comfyui_image_metadata_extension/issues/67
     def get_cache(self, input_unique_id, unique_id=None):
-        if hasattr(self._cache, "get_cache"):
-            return self._cache.get_cache(input_unique_id, unique_id)
-        return self.get_output_cache(input_unique_id, unique_id)
+        return self._lookup_cached(input_unique_id, unique_id)
 
 
 class Capture:
@@ -59,7 +75,12 @@ class Capture:
 
         for node_id, obj in prompt.items():
             class_type = obj["class_type"]
-            obj_class = NODE_CLASS_MAPPINGS[class_type]
+            obj_class = NODE_CLASS_MAPPINGS.get(class_type)
+            if obj_class is None:
+                # A node from an extension that is missing or failed to import
+                # would otherwise raise KeyError and abort the whole save.
+                print_warning(f"Node class '{class_type}' is not registered, skipping it.")
+                continue
             node_inputs = obj["inputs"]
 
             input_data = get_input_data(
@@ -197,6 +218,39 @@ class Capture:
         lora_hashes_string = ", ".join(lora_hashes_list)
         return lora_strings, lora_hashes_string, updated_prompts
 
+    # 触发词匹配用的词边界：避免 "yui" 命中 "yuihane" 这类子串
+    _WORD_BOUNDARY_RE = re.compile(r"[a-z0-9_]")
+
+    @classmethod
+    def _append_trigger_words(cls, positive, prompt):
+        """把触发词切换器中已勾选、但尚未出现在提示词里的词补到末尾。"""
+        if not positive or not prompt:
+            return positive
+
+        try:
+            from .defs.ext.lora_manager import get_active_trigger_words
+            triggers = get_active_trigger_words(prompt)
+        except Exception:
+            return positive
+
+        if not triggers:
+            return positive
+
+        low = positive.lower()
+        missing = []
+        for word in triggers:
+            needle = word.lower()
+            if not needle:
+                continue
+            pattern = r"(?<![a-z0-9_])" + re.escape(needle) + r"(?![a-z0-9_])"
+            if not re.search(pattern, low):
+                missing.append(word)
+
+        if not missing:
+            return positive
+
+        return positive.rstrip().rstrip(",") + ", " + ", ".join(missing)
+
     @classmethod
     def gen_pnginfo_dict(cls, inputs_before_sampler_node, inputs_before_this_node, prompt, save_civitai_sampler=True):
         pnginfo = {}
@@ -255,6 +309,12 @@ class Capture:
             
         # Append LoRA models to the positive prompt, which is required for the Civitai website to parse and apply LoRA weights.
         # Format: <lora:Lora_Model_Name:weight_value>. Example: <lora:Lora_Name_00:0.6> <lora:Lora_Name_01:0.8>
+        # Lora Manager 触发词切换器的勾选结果。它们经由字符串拼接节点进入提示词，
+        # 而那条拼接链的运行时值常常取不到，导致触发词在落盘时丢失。这里按 widget
+        # 值兜底补齐（已存在的词不会重复追加）。
+        # 补在 LoRA 标签之前，保持 <lora:name:weight> 收尾的惯例。
+        positive = cls._append_trigger_words(positive, prompt)
+
         if lora_strings:
             positive += " " + " ".join(lora_strings)
 
@@ -310,8 +370,12 @@ class Capture:
             pnginfo["Denoising strength"] = float(dval)
 
         # Include upscale info if present
-        if inputs_before_this_node.get(MetaField.UPSCALE_BY) or inputs_before_this_node.get(MetaField.UPSCALE_MODEL_NAME):
-            pnginfo["Denoising strength"] = float(dval or 1.0)
+        if (inputs_before_this_node.get(MetaField.UPSCALE_BY)
+                or inputs_before_this_node.get(MetaField.UPSCALE_MODEL_NAME)):
+            # Only supply the implicit 1.0 of a hires pass. Writing it
+            # unconditionally would clobber a real denoise value captured above.
+            if "Denoising strength" not in pnginfo:
+                pnginfo["Denoising strength"] = float(dval) if dval else 1.0
 
         # Hi-Res, based on https://github.com/civitai/civitai/blob/0c6a61b2d3ee341e77a357d4c08cf220e22b1190/src/server/common/model-helpers.ts#L33
         extract(MetaField.UPSCALE_BY, "Hires upscale", inputs_before_this_node)

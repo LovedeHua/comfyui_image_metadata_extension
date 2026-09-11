@@ -1,5 +1,7 @@
+import glob
 import json
 import os
+import posixpath
 import re
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +51,7 @@ class SaveImageWithMetaData:
     QUALITY_OPTIONS = [e for e in QualityOption]
     METADATA_OPTIONS = [e for e in MetadataScope]
     NEEDS_METADATA_KEYS = {"seed", "width", "height", "pprompt", "nprompt", "model"}
+    EXIF_FORMATS = ("jpg", "webp")
 
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
@@ -130,15 +133,83 @@ class SaveImageWithMetaData:
             QualityOption.LOW: 30
         }.get(quality, 100)
 
+    @staticmethod
+    def sanitize_subdirectory(name: str) -> str:
+        """
+        Keeps a user supplied subdirectory inside the output directory.
+
+        Strips drive letters, leading separators and any "." / ".." segment so a
+        value like "../../foo" or "C:\\foo" cannot write outside of the output
+        directory. Returns a relative path, or "" when nothing is left.
+        """
+        cleaned = name.replace("\\", "/")
+        cleaned = os.path.splitdrive(cleaned)[1]
+        # Normalize first so segments such as "a/../../b" collapse to "../b"
+        # instead of silently landing one level below the intended folder.
+        normalized = posixpath.normpath(cleaned)
+        parts = [p for p in normalized.split("/") if p and p != "."]
+        while parts and parts[0] == "..":
+            parts.pop(0)
+        return "/".join(parts)
+
     def find_next_available_filename(self, folder: str, name: str, ext: str):
         """
         Finds the next available filename by checking existing files in the directory.
         """
-        existing = {f.stem for f in Path(folder).glob(f"{name}_*.{ext}")}
+        # Escape the name: it may come from a prompt placeholder and contain glob
+        # metacharacters ("[", "]", "*"), which would silently match other files
+        # and hand back a name that is already taken.
+        pattern = f"{glob.escape(name)}_*.{ext}"
+        existing = {f.stem for f in Path(folder).glob(pattern)}
         i = 1
         while f"{name}_{i:05d}" in existing:
             i += 1
         return i
+
+    def build_exif_bytes(self, pnginfo_dict, extra_metadata):
+        """
+        Build the EXIF payload for jpg/webp output.
+
+        The A1111 style parameters keep going into UserComment, while the custom
+        pairs are stored in ImageDescription as UTF-8 JSON. JPEG/WebP have no
+        free-form text chunk like PNG's tEXt block, and ImageDescription is the
+        most widely read free-text tag (exiftool, file managers, PIL). Keeping
+        them apart also leaves the parameters string parseable by Civitai.
+        """
+        exif_ifd = {
+            piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                Capture.gen_parameters_str(pnginfo_dict), encoding="unicode"
+            )
+        }
+
+        zeroth = {}
+        if extra_metadata:
+            zeroth[piexif.ImageIFD.ImageDescription] = json.dumps(
+                extra_metadata, ensure_ascii=False
+            ).encode("utf-8")
+
+        return piexif.dump({"0th": zeroth, "Exif": exif_ifd})
+
+    def insert_exif(self, path, pnginfo_dict, extra_metadata):
+        """
+        Write EXIF into an already saved file.
+
+        Failures only warn: losing metadata must not lose the image itself.
+        """
+        try:
+            piexif.insert(self.build_exif_bytes(pnginfo_dict, extra_metadata), path)
+        except Exception as e:
+            print_warning(f"Could not write EXIF metadata into '{path}': {e}")
+
+    @staticmethod
+    def write_workflow_json(folder, image_filename, workflow):
+        """Write <image stem>.json beside the image it belongs to."""
+        json_path = os.path.join(folder, os.path.splitext(image_filename)[0] + ".json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(workflow, f)
+        except Exception as e:
+            print_warning(f"Failed to write workflow JSON '{json_path}': {e}")
 
     @classmethod
     def parse_filename_placeholders(cls, filename: str) -> list[str]:
@@ -177,18 +248,33 @@ class SaveImageWithMetaData:
             filename_prefix, self.output_dir, image_shape[1], image_shape[0]
         )
 
-        # Handle subdirectory naming and creation
-        subdirectory_name = subdirectory_name.strip()
+        # Handle subdirectory naming and creation.
+        # Placeholders were already resolved above, so this step only sanitizes
+        # the path (re-running format_filename here could receive a None dict and
+        # would also re-expand values that legitimately contain "%").
+        raw_subdirectory = subdirectory_name.strip()
+        subdirectory_name = self.sanitize_subdirectory(raw_subdirectory)
+        if subdirectory_name != raw_subdirectory.replace("\\", "/"):
+            print_warning(
+                f"Subdirectory name was adjusted to stay inside the output "
+                f"directory: '{raw_subdirectory}' -> '{subdirectory_name}'"
+            )
+
         if subdirectory_name:
-            subdirectory_name = self.format_filename(subdirectory_name, pnginfo_dict)
-            full_output_folder = os.path.join(self.output_dir, subdirectory_name)
+            full_output_folder = os.path.join(self.output_dir, *subdirectory_name.split("/"))
             filename = filename_prefix
 
         os.makedirs(full_output_folder, exist_ok=True)
 
+        # Resolve the workflow once; it is written next to every image below.
+        workflow = None
+        if save_workflow_json:
+            workflow = (extra_pnginfo or {}).get("workflow")
+            if workflow is None:
+                print_warning("Workflow data is unavailable, no JSON sidecar file will be written.")
+
         results = list()
         images_length = len(images)
-        last_image_filename = None
 
         # Process each image
         for batch_number, image in enumerate(images):
@@ -210,7 +296,6 @@ class SaveImageWithMetaData:
                 file = f"{filename}_{count:05d}.{base_format}"
                 path = os.path.join(full_output_folder, file)
 
-            last_image_filename = file
             quality_value = self.get_quality_value(quality)
 
             # Save image based on format
@@ -222,23 +307,14 @@ class SaveImageWithMetaData:
                 img.save(path, optimize=True, quality=quality_value)
 
             # Insert EXIF for jpg/webp formats
-            if base_format in ["jpg", "webp"]:
-                exif_bytes = piexif.dump({
-                    "Exif": {
-                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(Capture.gen_parameters_str(pnginfo_dict), encoding="unicode")
-                    }
-                })
-                piexif.insert(exif_bytes, path)
+            if base_format in self.EXIF_FORMATS:
+                self.insert_exif(path, pnginfo_dict, extra_metadata)
+
+            # Write the workflow sidecar for this image, not just for the last one
+            if workflow is not None:
+                self.write_workflow_json(full_output_folder, file, workflow)
 
             results.append({"filename": file, "subfolder": full_output_folder, "type": self.type})
-
-        # Save workflow metadata for the batch
-        if save_workflow_json and images_length > 0 and last_image_filename:
-            json_filename = last_image_filename.replace(base_format, "json")
-            batch_json_file = os.path.join(full_output_folder, json_filename)
-
-            with open(batch_json_file, "w", encoding="utf-8") as f:
-                json.dump(extra_pnginfo["workflow"], f)
 
         return {"ui": {"images": results}}
 
@@ -247,7 +323,10 @@ class SaveImageWithMetaData:
         Return final PNG metadata with batch information, parameters, and optional prompt details.
         """
         if metadata_scope == MetadataScope.NONE:
-            return None
+            # Return an empty container rather than None: the caller still writes
+            # the user supplied extra_metadata on top of it, and PngInfo is safe
+            # to pass to PIL even when it holds nothing.
+            return PngInfo()
 
         if pnginfo_dict:
             pnginfo_copy = pnginfo_dict.copy()

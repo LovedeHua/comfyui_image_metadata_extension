@@ -26,6 +26,7 @@ if os.path.exists(CACHE_FILE):
         print_error(f"Failed to load cache file {CACHE_FILE}: {e}")
         _disk_cache = {}
 
+
 @lru_cache(maxsize=100)  # Cache up to 100 file modification times
 def get_file_mod_time(path):
     try:
@@ -53,14 +54,21 @@ def save_disk_cache():
     except Exception as e:
         print_error(f"Failed to write cache to {CACHE_FILE}: {e}")
 
-def calc_hash(filename, use_only_filename=True):
+def calc_hash(filename, use_only_filename=False):
     global _disk_cache_dirty
 
     if not filename or not os.path.isfile(filename):
         print_warning(f"calc_hash: File not found or invalid path: {filename}")
         return ""
 
-    key = os.path.basename(filename) if use_only_filename else filename
+    # The cache key must be unique per file. Using only the basename lets two
+    # different models that share a file name (e.g. models/loras/foo.safetensors
+    # and models/checkpoints/foo.safetensors) collide and return a wrong hash,
+    # which would make Civitai match the wrong resource.
+    if use_only_filename:
+        key = os.path.basename(filename)
+    else:
+        key = os.path.normcase(os.path.normpath(os.path.abspath(filename)))
     current_mod_time = get_file_mod_time(filename)
 
     with _cache_lock:
@@ -107,3 +115,12 @@ def calc_hash(filename, use_only_filename=True):
     except Exception as e:
         print_error(f"Failed to calculate hash for {filename}: {e}")
         return ""
+
+
+# Legacy entries were keyed by basename only, which collides across model
+# folders and may hold a hash that belongs to a different file. Drop them once,
+# at import time, so the on-disk cache migrates to full-path keys.
+if any(not os.path.isabs(k) for k in _disk_cache):
+    _disk_cache = {k: v for k, v in _disk_cache.items() if os.path.isabs(k)}
+    _disk_cache_dirty = True
+    save_disk_cache()
