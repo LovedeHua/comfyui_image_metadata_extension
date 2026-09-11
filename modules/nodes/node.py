@@ -63,46 +63,46 @@ class SaveImageWithMetaData:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "images": ("IMAGE", {"tooltip": "The images to save."}),
-                "filename_prefix": ("STRING", {"default": "ComfyUI", "tooltip": "The prefix for the saved file. You can include formatting options like %date:yyyy-MM-dd% or %seed%, and combine them as needed, e.g., %date:hhmmss%_%seed%."}),
+                "images": ("IMAGE", {"tooltip": "要保存的图像。"}),
+                "filename_prefix": ("STRING", {"default": "ComfyUI", "tooltip": "保存文件名的前缀。可使用格式化占位符，如 %date:yyyy-MM-dd% 或 %seed%，也可以组合使用，例如 %date:hhmmss%_%seed%。"}),
                 "subdirectory_name": ("STRING", {
                     "default": "",
                     "tooltip": (
-                        "Custom directory to save the images. Leave empty to use the default output "
-                        "directory. You can include formatting options like %date:yyyy-MM-dd%."
+                        "自定义子目录。留空则保存到默认输出目录。"
+                        "可使用格式化占位符，如 %date:yyyy-MM-dd%。"
                     ),
                 }),
                 "output_format": (s.OUTPUT_FORMATS, {
-                    "tooltip": "The format in which the images will be saved."
+                    "tooltip": "图像的保存格式。"
                 }),
             },
             "optional": {
                 "extra_metadata": ("EXTRA_METADATA", {
-                    "tooltip": "Additional key-value metadata to include in the image."
+                    "tooltip": "写入图像的附加键值对元数据。"
                 }),
                 "quality": (s.QUALITY_OPTIONS, {
-                    "tooltip": "Image quality:"
+                    "tooltip": "图像质量："
                             "\n'max' / 'lossless WebP' - 100"
                             "\n'high' - 80"
                             "\n'medium' - 60"
                             "\n'low' - 30"
-                            "\n\nNote: Lower quality, smaller file size. PNG images ignore this setting."
+                            "\n\n质量越低、文件越小。PNG 格式忽略此设置。"
                 }),
                 "metadata_scope": (s.METADATA_OPTIONS, {
-                    "tooltip": "Choose the metadata to save: "
-                            "\n'full' - default metadata with additional metadata, "
-                            "\n'default' - same as SaveImage node, "
-                            "\n'parameters_only' - only A1111-style metadata, "
-                            "\n'workflow_only' - workflow metadata only, "
-                            "\n'none' - no metadata."
+                    "tooltip": "选择要写入的元数据："
+                            "\n'full' - 默认元数据 + 附加元数据，"
+                            "\n'default' - 与原生 SaveImage 节点相同，"
+                            "\n'parameters_only' - 仅 A1111 风格参数，"
+                            "\n'workflow_only' - 仅工作流数据，"
+                            "\n'none' - 不保存。"
                 }),
                 "include_batch_num": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Include batch number in filename."
+                    "tooltip": "文件名中包含批次序号。"
                 }),
                 "prefer_nearest": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Select inputs from closest nodes first if true."
+                    "tooltip": "为 true 时优先从拓扑距离最近的节点取值。"
                 }),
             },
             "hidden": {
@@ -114,8 +114,9 @@ class SaveImageWithMetaData:
     RETURN_TYPES = ()
     FUNCTION = "save_images"
     OUTPUT_NODE = True
-    DESCRIPTION = "Saves the input images with metadata to your ComfyUI output directory."
+    DESCRIPTION = "将输入图像连同元数据一起保存到 ComfyUI 输出目录。"
     CATEGORY = "SaveImage"
+    SEARCH_ALIASES = ["保存图像", "元数据", "save image", "metadata", "civitai"]
 
     pattern_format = re.compile(r"(%[^%]+%)") # Pattern to match mask values in the filename
 
@@ -435,7 +436,11 @@ class CreateExtraMetaData:
             "optional": {
                 "extra_metadata": ("EXTRA_METADATA", {"forceInput": True}),
                 **{
-                    f"{type}{i}": ("STRING", {"default": "", "multiline": False})
+                    f"{type}{i}": ("STRING", {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": f"第 {i} 组的{'键名' if type == 'key' else '值'}",
+                    })
                     for i in range(1, 5)
                     for type in ["key", "value"]
                 },
@@ -444,7 +449,7 @@ class CreateExtraMetaData:
 
     RETURN_TYPES = ("EXTRA_METADATA",)
     FUNCTION = "create_extra_metadata"
-    DESCRIPTION = "Creates custom extra metadata by adding key-value pairs. Empty values are allowed, but unpaired values are not."
+    DESCRIPTION = "通过键值对创建自定义附加元数据。允许空值，但键和值必须成对出现。"
     CATEGORY = "SaveImage"
 
     def create_extra_metadata(self, extra_metadata=None, **keys_values):
